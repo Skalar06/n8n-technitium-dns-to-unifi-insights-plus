@@ -1,307 +1,181 @@
-const inputItem = $input.first();
-const payload = inputItem.json?.body ?? [];
-const entries = Array.isArray(payload) ? payload : [payload];
-
-const blockedTypes = new Set(["SOA", "IXFR"]);
-
-// Exact client IP filters.
-// Keep these for known infrastructure IPs that should never appear as real clients.
-const blockedClientIps = new Set([
-  "192.0.2.10",
-  "192.0.2.11",
-  "198.51.100.10",
-  "172.16.0.1",
-]);
-
-// Optional IPv4 subnet filters for internal bridge / gateway / docker ranges.
-// Leave empty in the public template unless you explicitly want to filter ranges.
-// Example real-world values could be:
-// "172.21.16.0/24",
-// "172.22.16.0/24",
-const blockedClientCidrs = [
-  // "172.21.16.0/24",
-  // "172.22.16.0/24",
-];
-
-// RFC3164 BSD timestamp in UTC with space-padded day ("Apr  4").
-// If ts is missing, current UTC time is used.
-// If ts is present but invalid, null is returned so the caller can skip
-// only that single entry instead of aborting the whole batch.
-function formatRfc3164(ts) {
-  const hasExplicitTimestamp =
-    ts !== null &&
-    ts !== undefined &&
-    String(ts).trim() !== "";
-
-  const date = hasExplicitTimestamp ? new Date(ts) : new Date();
-
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
-
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-  const mon = months[date.getUTCMonth()];
-  const day = date.getUTCDate();
-  const dd = day < 10 ? ` ${day}` : `${day}`;
-  const hh = String(date.getUTCHours()).padStart(2, "0");
-  const mm = String(date.getUTCMinutes()).padStart(2, "0");
-  const ss = String(date.getUTCSeconds()).padStart(2, "0");
-
-  return `${mon} ${dd} ${hh}:${mm}:${ss}`;
-}
-
-function tryParseJsonString(value) {
-  if (typeof value !== "string" || !value.trim()) return null;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
-}
-
-function normalizeClientIp(value) {
-  let normalized = String(value ?? "").trim();
-  if (!normalized) return "";
-
-  // Strip optional brackets and port from client IPs
-  // Examples:
-  // [::1]:5353  -> ::1
-  // [fd00::1]   -> fd00::1
-  // 10.0.0.5:53 -> 10.0.0.5
-  const bracketedIpv6Match = normalized.match(/^\[([0-9a-fA-F:.]+)\](?::\d+)?$/);
-  if (bracketedIpv6Match) return bracketedIpv6Match[1];
-
-  const ipv4WithPortMatch = normalized.match(/^((?:\d{1,3}\.){3}\d{1,3})(?::\d+)?$/);
-  if (ipv4WithPortMatch) return ipv4WithPortMatch[1];
-
-  const plainIpMatch = normalized.match(/^([0-9a-fA-F:.]+)$/);
-  if (plainIpMatch) return plainIpMatch[1];
-
-  return normalized;
-}
-
-function isValidIpv4(ip) {
-  if (typeof ip !== "string") return false;
-  const parts = ip.split(".");
-  if (parts.length !== 4) return false;
-
-  for (const part of parts) {
-    if (!/^\d+$/.test(part)) return false;
-    const num = Number(part);
-    if (num < 0 || num > 255) return false;
-  }
-
-  return true;
-}
-
-function ipv4ToInt(ip) {
-  if (!isValidIpv4(ip)) return null;
-  const [a, b, c, d] = ip.split(".").map(Number);
-  return (((a * 256 + b) * 256 + c) * 256 + d) >>> 0;
-}
-
-function parseIpv4Cidr(cidr) {
-  if (typeof cidr !== "string") return null;
-
-  const trimmed = cidr.trim();
-  const match = trimmed.match(/^((?:\d{1,3}\.){3}\d{1,3})\/(\d{1,2})$/);
-  if (!match) return null;
-
-  const networkIp = match[1];
-  const prefix = Number(match[2]);
-
-  if (!isValidIpv4(networkIp)) return null;
-  if (prefix < 0 || prefix > 32) return null;
-
-  const networkInt = ipv4ToInt(networkIp);
-  if (networkInt === null) return null;
-
-  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
-  const normalizedNetwork = networkInt & mask;
-
-  return {
-    cidr: trimmed,
-    prefix,
-    mask,
-    networkInt: normalizedNetwork,
-  };
-}
-
-function isIpv4InCidr(ip, cidr) {
-  const ipInt = ipv4ToInt(ip);
-  const parsedCidr = parseIpv4Cidr(cidr);
-
-  if (ipInt === null || parsedCidr === null) {
-    return null;
-  }
-
-  return (ipInt & parsedCidr.mask) === parsedCidr.networkInt;
-}
-
-function getClientIpSkipReason(clientIp) {
-  if (!clientIp) {
-    return "missing_client_ip";
-  }
-
-  if (blockedClientIps.has(clientIp)) {
-    return `filtered_client_ip_${clientIp}`;
-  }
-
-  if (isValidIpv4(clientIp)) {
-    for (const cidr of blockedClientCidrs) {
-      const match = isIpv4InCidr(clientIp, cidr);
-
-      if (match === null) {
-        return `invalid_blocked_client_cidr_${cidr}`;
-      }
-
-      if (match) {
-        return `filtered_client_subnet_${cidr}`;
-      }
-    }
-  }
-
-  return null;
-}
-
-const out = [];
-
-for (const entry of entries) {
-  const parsed =
-    tryParseJsonString(entry?.RenderedMessage) ??
-    tryParseJsonString(entry?.MessageTemplate) ??
-    (entry && typeof entry === "object" ? entry : null);
-
-  if (!parsed || typeof parsed !== "object") {
-    out.push({
-      json: {
-        ok: true,
-        forwarded: false,
-        skipReason: "unparsable_log_entry",
-        original: entry,
+{
+  "name": "Technitium DNS -> UniFi Log Insights DNS (Public Template) v0.1.1",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "technitium-dns-log-export",
+        "responseMode": "responseNode",
+        "options": {}
       },
-    });
-    continue;
-  }
-
-  const timestampRaw =
-    parsed.timestamp ??
-    parsed.Timestamp ??
-    entry?.Timestamp ??
-    null;
-
-  const clientIpRaw =
-    parsed.clientIp ??
-    parsed.clientIPAddress ??
-    parsed.client ??
-    parsed.remoteAddress ??
-    null;
-
-  const question = parsed.question ?? {};
-
-  const questionName =
-    question.questionName ??
-    question.name ??
-    parsed.questionName ??
-    parsed.domain ??
-    null;
-
-  const questionType =
-    question.questionType ??
-    question.type ??
-    parsed.questionType ??
-    parsed.type ??
-    null;
-
-  const protocolRaw = String(parsed.protocol ?? "").trim();
-  const responseCodeRaw = String(parsed.responseCode ?? "").trim();
-  const responseTypeRaw = String(parsed.responseType ?? "").trim();
-
-  const normalizedType = String(questionType ?? "").trim().toUpperCase();
-  const normalizedName = String(questionName ?? "").trim();
-  const normalizedClientIp = normalizeClientIp(clientIpRaw);
-
-  let skipReason = null;
-
-  if (!normalizedType) {
-    skipReason = "missing_question_type";
-  } else if (!normalizedName) {
-    skipReason = "missing_question_name";
-  } else if (blockedTypes.has(normalizedType)) {
-    skipReason = `filtered_type_${normalizedType}`;
-  } else {
-    skipReason = getClientIpSkipReason(normalizedClientIp);
-  }
-
-  if (skipReason) {
-    out.push({
-      json: {
-        ok: true,
-        forwarded: false,
-        skipReason,
-        original: parsed,
-        originalEntry: entry,
-      },
-    });
-    continue;
-  }
-
-  const rfc3164Timestamp = formatRfc3164(timestampRaw);
-
-  if (!rfc3164Timestamp) {
-    out.push({
-      json: {
-        ok: true,
-        forwarded: false,
-        skipReason: "invalid_timestamp",
-        parsed: {
-          timestampRaw,
-          clientIp: normalizedClientIp,
-          questionName: normalizedName,
-          questionType: normalizedType,
-          protocol: protocolRaw || null,
-          responseCode: responseCodeRaw || null,
-          responseType: responseTypeRaw || null,
-        },
-        original: parsed,
-        originalEntry: entry,
-      },
-    });
-    continue;
-  }
-
-  const extras = [
-    protocolRaw ? `proto=${protocolRaw}` : null,
-    responseCodeRaw ? `rcode=${responseCodeRaw}` : null,
-    responseTypeRaw ? `rtype=${responseTypeRaw}` : null,
-  ].filter(Boolean).join(" ");
-
-  const syslogLine =
-    `<14>${rfc3164Timestamp} technitium-dns dnsmasq[1]: ` +
-    `query[${normalizedType}] ${normalizedName} from ${normalizedClientIp}` +
-    (extras ? ` ${extras}` : "");
-
-  out.push({
-    json: {
-      ok: true,
-      forwarded: true,
-      skipReason: null,
-      syslogLine,
-      parsed: {
-        timestampRaw,
-        clientIp: normalizedClientIp,
-        questionName: normalizedName,
-        questionType: normalizedType,
-        protocol: protocolRaw || null,
-        responseCode: responseCodeRaw || null,
-        responseType: responseTypeRaw || null,
-      },
-      original: parsed,
-      originalEntry: entry,
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1424,
+        -208
+      ],
+      "id": "92c183f1-3018-41d4-a600-1dadfa8e7ebd",
+      "name": "Webhook"
     },
-  });
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "5d6769e1-0808-43ed-92da-022acbb4d9fb",
+              "leftValue": "={{$json.headers['x-log-exporter-token']}}",
+              "rightValue": "CHANGE_ME_SHARED_TOKEN",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1200,
+        -208
+      ],
+      "id": "32dc90c4-0891-45d9-9ebf-73297e5b9f27",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\":true}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -528,
+        -304
+      ],
+      "id": "05473b99-1c82-4b15-9da9-e6b3a97ebdc7",
+      "name": "Respond to Webhook 'true'"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "{{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -976,
+        -112
+      ],
+      "id": "c515fd27-ea49-49c8-8d24-740c03752a3a",
+      "name": "Respond to Webhook 'forbidden'"
+    },
+    {
+      "parameters": {
+        "command": "={{ \"sh -lc 'printf \\\"%s\\\\n\\\" \" + JSON.stringify($json.syslogLine) + \" | nc -u -w1 unifi-log-insight 514'\" }}"
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -752,
+        -304
+      ],
+      "id": "d522ddd8-3ae5-4ca9-9b20-4b9d4cd90c88",
+      "name": "Execute Command"
+    },
+    {
+      "parameters": {
+        "jsCode": "const inputItem = $input.first();\nconst payload = inputItem.json?.body ?? [];\nconst entries = Array.isArray(payload) ? payload : [payload];\n\nconst blockedTypes = new Set([\"SOA\", \"IXFR\"]);\nconst blockedClientIps = new Set([\n  \"192.0.2.10\",\n  \"192.0.2.11\",\n  \"198.51.100.10\",\n  \"172.16.0.1\",\n]);\n\nfunction formatRfc3164Berlin(ts) {\n  const date = ts ? new Date(ts) : new Date();\n  if (Number.isNaN(date.getTime())) {\n    throw new Error(`Ungültiger Timestamp: ${ts}`);\n  }\n\n  const parts = new Intl.DateTimeFormat(\"en-US\", {\n    timeZone: \"Europe/Berlin\",\n    month: \"short\",\n    day: \"2-digit\",\n    hour: \"2-digit\",\n    minute: \"2-digit\",\n    second: \"2-digit\",\n    hour12: false,\n  }).formatToParts(date);\n\n  const map = Object.fromEntries(parts.map(p => [p.type, p.value]));\n  return `${map.month} ${map.day} ${map.hour}:${map.minute}:${map.second}`;\n}\n\nfunction tryParseJsonString(value) {\n  if (typeof value !== \"string\" || !value.trim()) return null;\n  try {\n    return JSON.parse(value);\n  } catch {\n    return null;\n  }\n}\n\nconst out = [];\n\nfor (const entry of entries) {\n  const parsed =\n    tryParseJsonString(entry.RenderedMessage) ??\n    tryParseJsonString(entry.MessageTemplate) ??\n    (entry && typeof entry === \"object\" ? entry : null);\n\n  if (!parsed || typeof parsed !== \"object\") {\n    out.push({\n      json: {\n        ok: true,\n        forwarded: false,\n        skipReason: \"unparsable_log_entry\",\n        original: entry,\n      },\n    });\n    continue;\n  }\n\n  const timestampRaw =\n    parsed.timestamp ??\n    parsed.Timestamp ??\n    entry.Timestamp ??\n    null;\n\n  const clientIp =\n    parsed.clientIp ??\n    parsed.clientIPAddress ??\n    parsed.client ??\n    parsed.remoteAddress ??\n    null;\n\n  const question = parsed.question ?? {};\n  const questionName =\n    question.questionName ??\n    question.name ??\n    parsed.questionName ??\n    parsed.domain ??\n    null;\n\n  const questionType =\n    question.questionType ??\n    question.type ??\n    parsed.questionType ??\n    parsed.type ??\n    null;\n\n  const protocolRaw = String(parsed.protocol ?? \"\").trim();\n  const responseCodeRaw = String(parsed.responseCode ?? \"\").trim();\n  const responseTypeRaw = String(parsed.responseType ?? \"\").trim();\n\n  const normalizedType = String(questionType ?? \"\").trim().toUpperCase();\n  const normalizedName = String(questionName ?? \"\").trim();\n  const normalizedClientIp = String(clientIp ?? \"\").trim();\n\n  let skipReason = null;\n\n  if (!normalizedType) {\n    skipReason = \"missing_question_type\";\n  } else if (!normalizedName) {\n    skipReason = \"missing_question_name\";\n  } else if (!normalizedClientIp) {\n    skipReason = \"missing_client_ip\";\n  } else if (blockedTypes.has(normalizedType)) {\n    skipReason = `filtered_type_${normalizedType}`;\n  } else if (blockedClientIps.has(normalizedClientIp)) {\n    skipReason = `filtered_client_${normalizedClientIp}`;\n  }\n\n  if (skipReason) {\n    out.push({\n      json: {\n        ok: true,\n        forwarded: false,\n        skipReason,\n        original: parsed,\n        originalEntry: entry,\n      },\n    });\n    continue;\n  }\n\n  const rfc3164Timestamp = formatRfc3164Berlin(timestampRaw);\n\n  const extras = [\n    protocolRaw ? `proto=${protocolRaw}` : null,\n    responseCodeRaw ? `rcode=${responseCodeRaw}` : null,\n    responseTypeRaw ? `rtype=${responseTypeRaw}` : null,\n  ].filter(Boolean).join(\" \");\n\n  const syslogLine =\n    `<14>${rfc3164Timestamp} technitium-dns dnsmasq[1]: ` +\n    `query[${normalizedType}] ${normalizedName} from ${normalizedClientIp}` +\n    (extras ? ` ${extras}` : \"\");\n\n  out.push({\n    json: {\n      ok: true,\n      forwarded: true,\n      skipReason: null,\n      syslogLine,\n      parsed: {\n        timestampRaw,\n        clientIp: normalizedClientIp,\n        questionName: normalizedName,\n        questionType: normalizedType,\n        protocol: protocolRaw || null,\n        responseCode: responseCodeRaw || null,\n        responseType: responseTypeRaw || null,\n      },\n      original: parsed,\n      originalEntry: entry,\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -976,
+        -304
+      ],
+      "id": "ef2d3bd2-1818-4ebd-9f7d-580c0a63a82a",
+      "name": "Transform -> RFC3164"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Transform -> RFC3164",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to Webhook 'forbidden'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Webhook 'forbidden'": {
+      "main": [
+        []
+      ]
+    },
+    "Execute Command": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook 'true'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transform -> RFC3164": {
+      "main": [
+        [
+          {
+            "node": "Execute Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  }
 }
-
-return out;
