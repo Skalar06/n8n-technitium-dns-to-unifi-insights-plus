@@ -189,6 +189,59 @@ Suitable for:
 - small to medium homelab or SMB environments
 - a quick bridge without building dedicated middleware
 
+## Technitium Log Exporter App configuration
+
+This workflow expects DNS query logs to be sent by the Technitium **Log Exporter App** using **HTTP POST**. Technitium supports exporting query logs to HTTP/HTTPS POST and Syslog sinks, and current versions support custom HTTP headers such as `x-log-exporter-token`. Do **not** publish your real token in the repository. Use placeholders in documentation and a unique secret in production.
+
+### Example configuration
+
+Configure the Technitium Log Exporter App approximately like this:
+
+- **Export / Sink type:** HTTP or HTTPS POST
+- **Webhook URL:** `https://YOUR-N8N-DOMAIN/webhook/technitium-dns-log-export`
+- **HTTP method:** `POST`
+- **Content-Type:** `application/json`
+- **Custom header:** `x-log-exporter-token: YOUR_TOKEN`
+
+### Expected payload
+
+The n8n workflow accepts a JSON object like this:
+
+```json
+{
+  "timestamp": "2026-04-13T22:07:05.486Z",
+  "clientIp": "10.0.0.50",
+  "protocol": "Udp",
+  "question": {
+    "questionClass": "IN",
+    "questionName": "cloudaccess.svc.ui.com",
+    "questionType": "A"
+  },
+  "responseCode": "NoError",
+  "responseType": "Recursive"
+}
+```
+
+The workflow also supports arrays of entries and will additionally try to parse JSON embedded in fields such as `RenderedMessage` or `MessageTemplate`.
+
+### Header requirement
+
+The webhook validates this header:
+
+```text
+x-log-exporter-token: YOUR_TOKEN
+```
+
+If the header is missing or does not match the configured shared secret, the workflow will reject the request with HTTP `403`.
+
+### Notes
+
+- UI labels in Technitium may vary slightly by version.
+- Keep the real token out of GitHub and use a placeholder such as `YOUR_TOKEN` in all examples.
+- If your Technitium instance sends a slightly different JSON structure, adapt the n8n Code node accordingly.
+- Test with a single DNS query first before enabling permanent export.
+
+
 ## License
 
 Free to use and modify at your own risk.
