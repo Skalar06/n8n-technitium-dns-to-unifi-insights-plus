@@ -1,3 +1,15 @@
+> [!WARNING]
+> **Deprecated**
+>
+> This n8n workflow is no longer maintained and will not receive further updates.
+>
+> Development has moved to the dedicated Technitium DNS Server add-on:
+> **[Technitium UniFi Insights Exporter](https://github.com/Skalar06/technitium-unifi-insights-exporter)**
+>
+> The add-on provides the same core functionality directly within Technitium, without requiring n8n. Existing users should migrate to the new add-on.
+
+
+
 # Technitium DNS -> UniFi Insights Plus DNS
 
 n8n workflow for receiving Technitium DNS query logs via webhook, transforming them into an RFC3164 / dnsmasq-like syslog format, and forwarding them to UniFi Log Insights via UDP syslog.
